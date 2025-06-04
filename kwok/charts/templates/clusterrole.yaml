@@ -47,6 +47,9 @@ rules:
   - apiGroups: ["policy"]
     resources: ["poddisruptionbudgets"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["llmaz.io"]
+    resources: ["openmodels"]
+    verbs: ["get", "list", "watch"]
   # Write
   - apiGroups: ["karpenter.sh"]
     resources: ["nodeclaims", "nodeclaims/status"]
