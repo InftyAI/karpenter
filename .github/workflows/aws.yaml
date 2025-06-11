@@ -1,0 +1,100 @@
+name: Build and Push AWS Karpenter Provider Image
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - release-*
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    env:
+      KO_DOCKER_REPO: docker.io/inftyai/karpenter-provider-aws
+
+    steps:
+      - name: Checkout forked karpenter
+        uses: actions/checkout@v4
+
+      - name: Set up Go 1.24
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Generate commit info and image tag
+        id: tag
+        run: |
+          BRANCH="${GITHUB_REF##*/}"
+          COMMIT=$(git rev-parse HEAD)
+          TIMESTAMP=$(git show -s --format=%ct "$COMMIT")
+          VERSION_DATE=$(date -u -d "@$TIMESTAMP" +'%Y%m%d%H%M%S')
+          PSEUDO_VERSION="v0.0.0-${VERSION_DATE}-${COMMIT:0:12}"
+
+          if [[ "$BRANCH" == "main" ]]; then
+            TAG="latest"
+            IMAGE_TAG="latest"
+          elif [[ "$BRANCH" == release-* ]]; then
+            TAG="${BRANCH#release-}"       # e.g. v0.36.2
+            IMAGE_TAG="${TAG#v}"           # e.g. 0.36.2
+          else
+            TAG="fork-${PSEUDO_VERSION}"
+            IMAGE_TAG="${TAG}"             # keep full tag
+          fi
+
+          {
+            echo "commit=$COMMIT"
+            echo "version=$PSEUDO_VERSION"
+            echo "tag=$TAG"
+            echo "image_tag=$IMAGE_TAG"
+          } >> "$GITHUB_OUTPUT"
+          echo "✅ Using image tag: $IMAGE_TAG"
+
+      - name: Clone karpenter-provider-aws
+        run: |
+          git clone https://github.com/aws/karpenter-provider-aws.git
+          cd karpenter-provider-aws
+
+          TAG="${{ steps.tag.outputs.tag }}"
+          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "🔄 Attempting to checkout provider tag: $TAG"
+            if git rev-parse "refs/tags/$TAG" >/dev/null 2>&1; then
+              git checkout "tags/$TAG" -b "build-from-tag-$TAG"
+            else
+              echo "❌ Tag '$TAG' not found in karpenter-provider-aws repo."
+              exit 1
+            fi
+          else
+            echo "🔄 Checking out provider branch: main"
+            git checkout main
+          fi
+
+      - name: Replace karpenter module with forked commit version
+        run: |
+          cd karpenter-provider-aws
+          go mod edit -replace sigs.k8s.io/karpenter=github.com/InftyAI/karpenter@${{ steps.tag.outputs.version }}
+          go mod tidy
+
+      - name: Install build tools via make toolchain
+        run: |
+          cd karpenter-provider-aws
+          make toolchain
+
+      - name: Login to DockerHub
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 #v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push image using ko
+        run: |
+          cd karpenter-provider-aws
+          ko build --bare \
+            --tags ${{ steps.tag.outputs.image_tag }} \
+            github.com/aws/karpenter-provider-aws/cmd/controller
+
+      - name: Show pushed image
+        run: |
+          echo "✅ Image pushed to:"
+          echo "${{ env.KO_DOCKER_REPO }}:${{ steps.tag.outputs.image_tag }}"
