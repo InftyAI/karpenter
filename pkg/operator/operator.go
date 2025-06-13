@@ -60,6 +60,8 @@ import (
 	"sigs.k8s.io/karpenter/pkg/operator/logging"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/utils/env"
+
+	llmazcoreapi "github.com/inftyai/llmaz/api/core/v1alpha1"
 )
 
 const (
@@ -192,7 +194,7 @@ func NewOperator() (context.Context, *Operator) {
 		return lo.Ternary(mgr.GetCache().WaitForCacheSync(req.Context()), nil, fmt.Errorf("failed to sync caches"))
 	}))
 	lo.Must0(mgr.AddReadyzCheck("crd", func(_ *http.Request) error {
-		objects := []client.Object{&v1.NodePool{}, &v1.NodeClaim{}}
+		objects := []client.Object{&v1.NodePool{}, &v1.NodeClaim{}, &llmazcoreapi.OpenModel{}}
 		for _, obj := range objects {
 			gvk, err := apiutil.GVKForObject(obj, scheme.Scheme)
 			if err != nil {
