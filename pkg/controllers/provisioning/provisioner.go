@@ -79,6 +79,7 @@ type Provisioner struct {
 	kubeClient     client.Client
 	batcher        *Batcher[types.UID]
 	volumeTopology *scheduler.VolumeTopology
+	modelInference *scheduler.ModelInference
 	cluster        *state.Cluster
 	recorder       events.Recorder
 	cm             *pretty.ChangeMonitor
@@ -94,6 +95,7 @@ func NewProvisioner(kubeClient client.Client, recorder events.Recorder,
 		cloudProvider:  cloudProvider,
 		kubeClient:     kubeClient,
 		volumeTopology: scheduler.NewVolumeTopology(kubeClient),
+		modelInference: scheduler.NewModelInference(kubeClient),
 		cluster:        cluster,
 		recorder:       recorder,
 		cm:             pretty.NewChangeMonitor(),
@@ -264,6 +266,12 @@ func (p *Provisioner) NewScheduler(
 	pods, err = p.injectVolumeTopologyRequirements(ctx, pods)
 	if err != nil {
 		return nil, fmt.Errorf("injecting volume topology requirements, %w", err)
+	}
+
+	// inject model inference requirements
+	pods, err = p.injectInferenceFlavorRequirements(ctx, pods)
+	if err != nil {
+		return nil, fmt.Errorf("injecting model inference requirements, %w", err)
 	}
 
 	// Calculate cluster topology, if a context error occurs, it is wrapped and returned
@@ -471,6 +479,7 @@ func (p *Provisioner) Validate(ctx context.Context, pod *corev1.Pod) error {
 		validateNodeSelector(ctx, pod),
 		validateAffinity(ctx, pod),
 		p.volumeTopology.ValidatePersistentVolumeClaims(ctx, pod),
+		p.modelInference.ValidateInferenceFlavors(ctx, pod),
 	)
 }
 
@@ -493,6 +502,21 @@ func (p *Provisioner) injectVolumeTopologyRequirements(ctx context.Context, pods
 				return nil, err
 			}
 			log.FromContext(ctx).WithValues("Pod", klog.KObj(pod)).Error(err, "failed getting volume topology requirements")
+		} else {
+			schedulablePods = append(schedulablePods, pod)
+		}
+	}
+	return schedulablePods, nil
+}
+
+func (p *Provisioner) injectInferenceFlavorRequirements(ctx context.Context, pods []*corev1.Pod) ([]*corev1.Pod, error) {
+	var schedulablePods []*corev1.Pod
+	for _, pod := range pods {
+		if err := p.modelInference.Inject(ctx, pod); err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				return nil, err
+			}
+			log.FromContext(ctx).WithValues("Pod", klog.KObj(pod)).Error(err, "failed getting model inference requirements")
 		} else {
 			schedulablePods = append(schedulablePods, pod)
 		}
