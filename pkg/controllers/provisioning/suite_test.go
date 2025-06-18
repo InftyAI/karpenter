@@ -49,9 +49,13 @@ import (
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/test"
+	testcrds "sigs.k8s.io/karpenter/pkg/test/crds"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 	"sigs.k8s.io/karpenter/pkg/test/v1alpha1"
 	. "sigs.k8s.io/karpenter/pkg/utils/testing"
+
+	llmazcoreapi "github.com/inftyai/llmaz/api/core/v1alpha1"
+	llmazinferenceapi "github.com/inftyai/llmaz/api/inference/v1alpha1"
 )
 
 var (
@@ -73,7 +77,7 @@ func TestAPIs(t *testing.T) {
 }
 
 var _ = BeforeSuite(func() {
-	env = test.NewEnvironment(test.WithCRDs(apis.CRDs...), test.WithCRDs(v1alpha1.CRDs...))
+	env = test.NewEnvironment(test.WithCRDs(apis.CRDs...), test.WithCRDs(v1alpha1.CRDs...), test.WithCRDs(testcrds.CRDs...))
 	ctx = options.ToContext(ctx, test.Options())
 	cloudProvider = fake.NewCloudProvider()
 	fakeClock = clock.NewFakeClock(time.Now())
@@ -2568,6 +2572,264 @@ var _ = Describe("Provisioning", func() {
 				node := ExpectScheduled(ctx, env.Client, pod)
 				Expect(node.Labels[v1.NodePoolLabelKey]).To(Equal(targetedNodePool.Name))
 			})
+		})
+	})
+
+	Context("Model Inference Requirements", func() {
+		It("should not schedule if the model is missing", func() {
+			ExpectApplied(ctx, env.Client, test.NodePool())
+			pod := test.UnschedulablePod(test.PodOptions{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						llmazcoreapi.ModelNameLabelKey: "unknown",
+					},
+				},
+			})
+			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+			ExpectMetricGaugeValue(pscheduling.IgnoredPodCount, 1, nil)
+			ExpectNotScheduled(ctx, env.Client, pod)
+		})
+		It("should schedule with model if the model does not have an inference flavor", func() {
+			model := test.OpenModel(test.OpenModelOptions{})
+			ExpectApplied(ctx, env.Client, test.NodePool(), model)
+			pod := test.UnschedulablePod(test.PodOptions{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						llmazcoreapi.ModelNameLabelKey: model.Name,
+					},
+				},
+			})
+			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+			ExpectScheduled(ctx, env.Client, pod)
+		})
+		It("should not schedule if the inference flavor annotation is incompatible between model and inference service", func() {
+			model := test.OpenModel(test.OpenModelOptions{})
+			ExpectApplied(ctx, env.Client, test.NodePool(), model)
+			pod := test.UnschedulablePod(test.PodOptions{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						llmazcoreapi.ModelNameLabelKey: model.Name,
+					},
+					Annotations: map[string]string{
+						llmazinferenceapi.InferenceServiceFlavorsAnnoKey: "unknown",
+					},
+				},
+			})
+			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+			ExpectMetricGaugeValue(pscheduling.IgnoredPodCount, 1, nil)
+			ExpectNotScheduled(ctx, env.Client, pod)
+		})
+		It("should schedule to target instance type if the model has the flavor", func() {
+			model := test.OpenModel(test.OpenModelOptions{
+				Flavors: []llmazcoreapi.Flavor{
+					{
+						Name: "test-flavor",
+						NodeSelector: map[string]string{
+							corev1.LabelInstanceTypeStable: "gpu-vendor-instance-type",
+						},
+					},
+				},
+			})
+			ExpectApplied(ctx, env.Client, test.NodePool(), model)
+			pod := test.UnschedulablePod(test.PodOptions{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						llmazcoreapi.ModelNameLabelKey: model.Name,
+					},
+				},
+			})
+			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+			node := ExpectScheduled(ctx, env.Client, pod)
+			Expect(node.Labels).To(HaveKeyWithValue(corev1.LabelInstanceTypeStable, "gpu-vendor-instance-type"))
+		})
+		It("should schedule to target instance type if inference service specifies the flavor and model has multiple flavors", func() {
+			model := test.OpenModel(test.OpenModelOptions{
+				Flavors: []llmazcoreapi.Flavor{
+					{
+						Name: "test-flavor-1",
+						NodeSelector: map[string]string{
+							corev1.LabelInstanceTypeStable: "gpu-vendor-instance-type",
+						},
+					},
+					{
+						Name: "test-flavor-2",
+						NodeSelector: map[string]string{
+							corev1.LabelInstanceTypeStable: "gpu-vendor-b-instance-type",
+						},
+					},
+				},
+			})
+			ExpectApplied(ctx, env.Client, test.NodePool(), model)
+			pod := test.UnschedulablePod(test.PodOptions{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						llmazcoreapi.ModelNameLabelKey: model.Name,
+					},
+					Annotations: map[string]string{
+						llmazinferenceapi.InferenceServiceFlavorsAnnoKey: "test-flavor-2",
+					},
+				},
+			})
+			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+			node := ExpectScheduled(ctx, env.Client, pod)
+			Expect(node.Labels).To(HaveKeyWithValue(corev1.LabelInstanceTypeStable, "gpu-vendor-b-instance-type"))
+		})
+		It("should schedule to first available instance type if some inference flavors are not supported by node pools", func() {
+			model := test.OpenModel(test.OpenModelOptions{
+				Flavors: []llmazcoreapi.Flavor{
+					{
+						Name: "test-flavor-1",
+						NodeSelector: map[string]string{
+							corev1.LabelInstanceTypeStable: "unavailable",
+						},
+					},
+					{
+						Name: "test-flavor-2",
+						NodeSelector: map[string]string{
+							corev1.LabelInstanceTypeStable: "gpu-vendor-b-instance-type",
+						},
+					},
+				},
+			})
+			ExpectApplied(ctx, env.Client, test.NodePool(), model)
+			pod := test.UnschedulablePod(test.PodOptions{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						llmazcoreapi.ModelNameLabelKey: model.Name,
+					},
+				},
+			})
+			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+			node := ExpectScheduled(ctx, env.Client, pod)
+			Expect(node.Labels).To(HaveKeyWithValue(corev1.LabelInstanceTypeStable, "gpu-vendor-b-instance-type"))
+		})
+		It("shouldn't schedule to the in-flight node claim even if the node claim is compatible with second inference flavor when the first inference flavor is supported by node pools", func() {
+			model := test.OpenModel(test.OpenModelOptions{
+				Flavors: []llmazcoreapi.Flavor{
+					{
+						Name: "test-flavor-1",
+						NodeSelector: map[string]string{
+							corev1.LabelInstanceTypeStable: "gpu-vendor-instance-type",
+						},
+					},
+					{
+						Name: "test-flavor-2",
+						NodeSelector: map[string]string{
+							corev1.LabelInstanceTypeStable: "gpu-vendor-b-instance-type",
+						},
+					},
+				},
+			})
+			ExpectApplied(ctx, env.Client, test.NodePool(), model)
+			pod1 := test.UnschedulablePod(test.PodOptions{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						llmazcoreapi.ModelNameLabelKey: model.Name,
+					},
+					Annotations: map[string]string{
+						llmazinferenceapi.InferenceServiceFlavorsAnnoKey: "test-flavor-2",
+					},
+				},
+			})
+			pod2 := test.UnschedulablePod(test.PodOptions{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						llmazcoreapi.ModelNameLabelKey: model.Name,
+					},
+				},
+			})
+			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod1, pod2)
+			node1 := ExpectScheduled(ctx, env.Client, pod1)
+			Expect(node1.Labels).To(HaveKeyWithValue(corev1.LabelInstanceTypeStable, "gpu-vendor-b-instance-type"))
+			node2 := ExpectScheduled(ctx, env.Client, pod2)
+			Expect(node2.Labels).To(HaveKeyWithValue(corev1.LabelInstanceTypeStable, "gpu-vendor-instance-type"))
+		})
+		It("should schedule to the in-flight node claim if the node claim is compatible with second inference flavor and the first inference flavor is unsupported by node pools", func() {
+			model := test.OpenModel(test.OpenModelOptions{
+				Flavors: []llmazcoreapi.Flavor{
+					{
+						Name: "test-flavor-1",
+						NodeSelector: map[string]string{
+							corev1.LabelInstanceTypeStable: "unavailable",
+						},
+					},
+					{
+						Name: "test-flavor-2",
+						NodeSelector: map[string]string{
+							corev1.LabelInstanceTypeStable: "gpu-vendor-b-instance-type",
+						},
+					},
+				},
+			})
+			ExpectApplied(ctx, env.Client, test.NodePool(), model)
+			pod1 := test.UnschedulablePod(test.PodOptions{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						llmazcoreapi.ModelNameLabelKey: model.Name,
+					},
+					Annotations: map[string]string{
+						llmazinferenceapi.InferenceServiceFlavorsAnnoKey: "test-flavor-2",
+					},
+				},
+			})
+			pod2 := test.UnschedulablePod(test.PodOptions{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						llmazcoreapi.ModelNameLabelKey: model.Name,
+					},
+				},
+			})
+			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod1, pod2)
+			node1 := ExpectScheduled(ctx, env.Client, pod1)
+			Expect(node1.Labels).To(HaveKeyWithValue(corev1.LabelInstanceTypeStable, "gpu-vendor-b-instance-type"))
+			node2 := ExpectScheduled(ctx, env.Client, pod2)
+			Expect(node2.Labels).To(HaveKeyWithValue(corev1.LabelInstanceTypeStable, "gpu-vendor-b-instance-type"))
+			Expect(node2.Name).To(Equal(node1.Name))
+		})
+		It("should not relax an added service inference node-selector away", func() {
+			model := test.OpenModel(test.OpenModelOptions{
+				Flavors: []llmazcoreapi.Flavor{
+					{
+						Name: "test-flavor",
+						NodeSelector: map[string]string{
+							corev1.LabelInstanceTypeStable: "gpu-vendor-instance-type",
+						},
+					},
+				},
+			})
+			ExpectApplied(ctx, env.Client, test.NodePool(), model)
+
+			pod := test.UnschedulablePod(test.PodOptions{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						llmazcoreapi.ModelNameLabelKey: model.Name,
+					},
+				},
+				NodeRequirements: []corev1.NodeSelectorRequirement{
+					{
+						Key:      "example.com/label",
+						Operator: corev1.NodeSelectorOpIn,
+						Values:   []string{"unsupported"},
+					},
+				},
+			})
+
+			// Add the second capacity type that is OR'd with the first. Previously we only added the service inference requirement
+			// to a single node selector term which would sometimes get relaxed away.  Now we add it to all of them to AND
+			// it with each existing term.
+			pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms = append(pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms,
+				corev1.NodeSelectorTerm{
+					MatchExpressions: []corev1.NodeSelectorRequirement{
+						{
+							Key:      v1.CapacityTypeLabelKey,
+							Operator: corev1.NodeSelectorOpIn,
+							Values:   []string{v1.CapacityTypeOnDemand},
+						},
+					},
+				})
+			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+			node := ExpectScheduled(ctx, env.Client, pod)
+			Expect(node.Labels).To(HaveKeyWithValue(corev1.LabelInstanceTypeStable, "gpu-vendor-instance-type"))
 		})
 	})
 })
